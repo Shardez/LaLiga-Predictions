@@ -1,0 +1,1075 @@
+---
+title: "LaLiga Soccer Games Outcome Prediction Report"
+author: "by Denis Sharoukhov, PhD"
+date: "Aug 24, 2017"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, echo=FALSE, message = FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, warnings = FALSE,
+                      message = FALSE)
+```
+
+### Introduction
+The goal of this project was to asses financial viability of applied machine learning in sports betting domain. For prototyping and training of machine learning algorithms historical data for soccer games played in LaLiga division (since 1993) was used. Betting odds of the most recent games in the (since 03/15/17 till) were used to estimate Return on Investment (ROI). Best models demonstrate 8 to 13% ROI using features engineered by calculating simple statistics representing time-weighted performance of each team including average number of goals scored playing at home and away, normalized difference in number of games won/lost and their derivatives. Models hyper-parameters were tuned on training dataset using caret package and repeated cross-validation. Validation data was used to choose best performing models. Best models were presented with untouched test dataset to get final estimation of their performance and calculate ROI using betting odds.
+Selected models: Lasso and Elastic-Net Regularized Generalized Linear Models (glmnet), Regularized Support Vector Machines with linear kernel(LiblineaR), Multi-layer Perceptron (RSNNS) and their simple voting ensemble.
+
+
+### Libraries
+List of libraries used in this project (keep updating list)
+```{r Load_Libraries}
+library(plyr);
+library(dplyr);library(tidyr);library(caret)
+library(class); library(e1071);library(ggplot2)
+library(glmnet)
+library(doParallel)
+```
+
+Enable parallel processing on Windows, using doParallel library:
+```{r Parallel_Computing}
+
+# Create clusters for parralel processing
+cl <- makeCluster(detectCores())
+# Register clusters they will be automatically detected by caret package
+registerDoParallel(cl)
+# To stop and unregister the clusters run:
+unregister <- function() {
+   env <- foreach:::.foreachGlobals
+   rm(list=ls(name=env), pos=env)
+}
+
+```
+
+```{r Working_Directory, echo=FALSE}
+setwd("C:/Projects/Portfolio/LaLiga-Soccer-Games-Prediction")
+```
+
+### Section A. Data Preparation
+
+### Loading raw data
+Let's start with reading csv files downloaded from [football-data.co.uk](http://www.football-data.co.uk/spainm.php). Each file contains results for separate seasons played since 1993. Let's combine them into a single dataframe.
+
+```{r Data_Load, eval=TRUE}
+
+listsp<-list.files(path = "./Data",full.names = T)
+laliga<-data.frame()
+
+for (i in 1:length(listsp)){
+   sp<-read.csv(listsp[i],header = T,na.strings=c("","NA"))
+   sp<-sp%>%
+      select(Div,Date,HomeTeam,AwayTeam,FTHG,FTAG,FTR)
+   sp<-sp%>%
+      filter(complete.cases(sp))
+   laliga<-rbind(laliga,sp)
+
+}
+
+#laliga$Date<-as.Date(laliga$Date,"%d/%m/%y")
+rm(sp)
+
+# Save combined data frame for later use
+# fwrite(laliga,'data_laliga_simple.csv')
+
+```
+### Data Cleaning 
+Let's turn "Date" column from character to date format, and rename "Home and Away Goals" columns. Additionally, to make data munging easier for the next step we will remove "Result" column. This information can be easily restored using difference between home and away team's goals.
+
+```{r Data_Clean_Up}
+
+#colnames(laliga)
+
+#laliga<-read.csv('data_laliga_simple.csv',header=T)
+#laliga<-laliga[,-1]
+
+laliga$Date<-as.Date(as.character(laliga$Date),"%d/%m/%y")
+
+laliga<-laliga%>%
+   rename(HomeGoals=FTHG)%>%
+   rename(AwayGoals=FTAG)%>%
+   select(-FTR)
+
+head(laliga, n=5)
+```
+
+### Split Home/Away 
+One of the teams is always playing at home. In order to extract information about home advantage, let's split each match into two data points: one from home team (Home=True) and another from away team (Home=False) perspective.  
+
+```{r Data_Split_Home_Away }
+df_home<-laliga %>%
+   gather(Home, Team, -Div,    -Date,  -AwayTeam  ,-HomeGoals, -AwayGoals)%>%
+   rename(Opponent=AwayTeam)%>%
+   rename(Team_Goals=HomeGoals)%>%
+   rename(Opponent_Goals=AwayGoals)%>%
+   select(Team,Opponent,Team_Goals,Opponent_Goals,Home,Div,Date)
+   
+df_away<- laliga %>%
+   gather(Home, Team, -Div,    -Date,  -HomeTeam  ,-HomeGoals, -AwayGoals)%>%
+   rename(Opponent=HomeTeam)%>%
+   rename(Team_Goals=AwayGoals)%>%
+   rename(Opponent_Goals=HomeGoals)%>%
+   select(Team,Opponent,Team_Goals,Opponent_Goals,Home,Div,Date)
+
+df<-bind_rows(df_home,df_away)%>%
+     mutate(Home=ifelse(Home=='HomeTeam',TRUE,FALSE))
+
+# Remove intermidate dataframes and call garbage collector
+rm(df_home,df_away)
+#gc()
+
+head(df,5)
+```
+
+Now let's add match results back, along with adding additional result column with values of +1,0,-1, representing either victory for one team (Win: +1) and defeat for another (Lose: -1), or draw for both teams (Draw: 0)  
+```{r Data_Add_Win_Lose_Draw}
+df<-df%>%
+   filter(complete.cases(df))%>%
+   mutate(Total_Goals=Team_Goals+Opponent_Goals)%>%
+   mutate(Match_Result=ifelse(Team_Goals>Opponent_Goals,'Win',ifelse(Team_Goals==Opponent_Goals,'Draw','Lose')))%>%
+   mutate(Result=ifelse(Match_Result=='Win',1,ifelse(Match_Result=='Draw',0,-1)))
+head(df,5)
+```
+
+In order to remove the risk of indirectly including information about results of the games that we would like to predict - let's split data into testing/training sets now. Data exploration will be done using training set only.
+
+```{r Data_Split_Train_Test}
+df_all<-df
+
+cutoff_date<-as.Date("2017/01/01")
+
+df<-df_all%>%
+   filter(Date<cutoff_date)
+
+df_testing<-df_all%>%
+   filter(Date>=cutoff_date)
+```
+
+### Section B. Exploratory Data Analysis
+Data is now in the "tidy" form: each row corresponds to a separate observation and each column represents either a variable or the match result.
+We can proceed to exploratory data analysis; let's start with quantifying the ratio of games resulted in draw, victory or defeat.  
+
+```{r EDA_Win_Loss_vs_Draw}
+
+df_h<-df%>%
+  filter(Home==T)
+cat("Number of games:",nrow(df_h),"\n")
+cat("\n")
+cat("Draws:",nrow(filter(df_h,Result==0)), "\n" , "Ratio:", nrow(filter(df_h,Result==0))/nrow(df_h), "\n")
+cat("\n")
+cat("Loses:",nrow(filter(df_h,Result==-1)),"\n","Ratio:", nrow(filter(df_h,Result==-1))/(nrow(df_h)), "\n")
+cat("\n")
+cat("Wins:",nrow(filter(df_h,Result==1)),"\n","Ratio:", nrow(filter(df_h,Result==1))/(nrow(df_h)))
+
+#cat("Non-draws:",nrow(filter(df_h,Result!=0)),"\n","Ratio:", nrow(filter(df_h,Result!=0))/(nrow(df_h)))
+
+#rm(df_h)
+#gc()
+```
+On average, home team wins 48% of the time and loses 26% of all games. About 26% of all games end up as the draw. 
+Home team wins in less than 50% of the cases so, without taking any bet odds into account, always betting on the home team winning already seems to be far from an ideal strategy.
+For us, however, it is more important that there is an imbalance between the classes: wins of the home team are much more abundant than draws or loses, so we need to keep that in mind when training classification models.
+
+### Distribution of Total (Both Teams) Goals Scored Per Game 
+As the next step, let's explore the distribution of total number of goals scored per game, i.e. goals of home and opponent team added together.
+```{r EDA_Plot_I_Total Goals}
+
+ggplot(df_h, aes(x=Total_Goals))+
+  ggtitle('Distribution of Total Goals Scored Per Game')+
+  geom_histogram(binwidth=1, colour="black",fill="white")+
+  scale_x_continuous(limits=c(-1, 13),breaks=(seq(-1,13,by=1)))
+
+```
+Most of the matches result in 2 goals total, followed by 3 and 1 goal games. Let's see what the usual outcome of such games is.
+
+### Distributions for Draw vs Win/Lose for Total Goals Scored Per Game
+Also, let's explore the most frequent number of goals scored in draw and non-draw (win or lose) games. Obviously, draw games can only have even number of combined goals: (0:0),(1:1), etc. win/lose games can, however, have both even or odd number as the final result.  
+```{r EDA_Plot_II_Draw_vs_Win_Lose}
+
+cols <- c("True"="#ff7400","False"="#029bf9")
+
+ggplot()+
+  ggtitle('Overlay of Distributions for Total Goals Scored in Draw vs Win/Lose Game')+
+  geom_histogram(data=filter(df_h,Match_Result!="Draw"), aes(x=Total_Goals, fill="False"),binwidth=1, colour="black",alpha = 0.70)+
+   geom_histogram(data=filter(df_h,Match_Result=="Draw"), aes(x=Total_Goals, fill="True"),binwidth=1, colour="black")+
+   scale_fill_manual(name="Draw?",values=cols)+
+   scale_x_continuous(limits=c(-1, 10),breaks=(seq(-1,10,by=1)))+
+   guides(fill = guide_legend(reverse = TRUE))
+
+```
+Interesting! The games with 2 goals total have almost identical chances to be either a draw or one team winning by difference of two goals. It is the most frequent draw scenario as well, when both teams scored only one goal each. The second most frequent draw case is when neither of the teams scored any goals at all.
+
+The most frequent win/lose case corresponds to both teams scoring 3 goals total. 
+Let's investigate the most probable ratio between team and opponent's goals in 3,4 and 5 goals games.
+First, by plotting the ratios:
+```{r EDA_Plot_III_345_Goals_Win_Lose_Games }
+
+ggplot()+
+  ggtitle('Distribution of Winnig Team Goals for 3,4,5 Total Goals Games')+
+  geom_histogram(data=filter(df,Match_Result=="Win"), aes(x=Total_Goals, fill=as.factor(Team_Goals)),binwidth=1, colour="black",fill="white")+
+  geom_histogram(data=filter(df,Match_Result=="Win"&Total_Goals==5), aes(x=Total_Goals, fill=as.factor(Team_Goals)),binwidth=1, colour="black")+
+  geom_histogram(data=filter(df,Match_Result=="Win"&Total_Goals==4), aes(x=Total_Goals, fill=as.factor(Team_Goals)),binwidth=1, colour="black")+
+  geom_histogram(data=filter(df,Match_Result=="Win"&Total_Goals==3), aes(x=Total_Goals, fill=as.factor(Team_Goals)),binwidth=1, colour="black")+
+  scale_fill_manual(name="Team Goals",breaks = c("2","3","4","5"), values=c("#ff7400", "#029bf9","#00e252","#e20080"))+
+  scale_x_continuous(limits=c(-1, 10),breaks=(seq(-1,10,by=1)))
+
+```
+And then quantifying them:
+```{r EDA_345_Goals_Win_Lose_Games_Ratios}
+
+df_expl<-df%>%
+  filter(Match_Result=="Win"&(Total_Goals==3|Total_Goals==4|Total_Goals==5))%>%
+  select(Total_Goals,Team_Goals,Opponent_Goals)%>%
+  group_by(Total_Goals,Team_Goals)%>%
+  summarise(N=n())%>%
+  mutate(Frequency=round(N/sum(N),2))
+
+df_expl
+
+```
+The winning team scoring 2 goals and losing team scoring only 1 goal is the most probable scenario (71% of all cases) for 3-goals games. However, games where winning team did not allow opponent to score at all are not that uncommon and correspond to 29% of all cases.  
+
+For 4-goals games (draws are not included) the ratios are the same: 71% of 3:1 games and 29% of 4:0 games.  
+
+5-goals games allow an additional case for the resulting winning score split:  
+The winning team leading by 1 goal with 3:2 score is the most frequent case (52%);
+Followed by 3 goals advantage 4:1 (35%);   
+Strong domination of the winning team (5:0 matches) occurs in 13% of the games.     
+
+Let's now take a look at which teams dominate most frequently in 5:0 games.
+```{r EDA_5_0 Games_PlotI}
+df_plot_5<-df%>%
+   filter(Total_Goals==5&Team_Goals==5)%>%
+   group_by(Team)%>%
+   summarise(N=n())%>%
+   arrange(desc(N))
+#sum(df_plot_5$N)
+
+ggplot(df_plot_5, aes(x = reorder(Team,N,max), y = N))+
+   geom_bar(stat="identity",color="green") +
+   xlab("Team") +
+   ylab("Number of 5:0 games (won)")+
+   coord_flip()
+   
+#rm(df_plot_5)
+```
+
+And, as well, which teams were dominated the most in 5:0 games
+```{r EDA_5_0_Games_PlotII}
+df_plot_5l<-df%>%
+   filter(Total_Goals==5&Team_Goals==5)%>%
+   group_by(Opponent)%>%
+   summarise(N=n())%>%
+   rename(Team=Opponent)%>%
+   arrange(desc(N))
+
+#sum(df_plot_5$N)
+
+ggplot(df_plot_5l, aes(x = reorder(Team,N,max), y = N))+
+   geom_bar(stat="identity",color='purple') +
+   xlab("Team") +
+   ylab("Number of 5:0 games (lost)")+
+   coord_flip()
+
+df_pl_5<-merge(df_plot_5,df_plot_5l,by="Team",all=T)   
+rm(df_plot_5,df_plot_5l,df_pl_5)
+```
+Real Madrid and Barcelona hold the title of the biggest oppressors, winning the most 5:0 games (21,20). Surprisingly, both of these teams also lost quite badly (0:5) twice throughout the history of the observations. Barcelona lost to Real Madrid and Santander, and Real Madrid lost both times to Barcelona. So they definitely don't mind oppressing each other.
+Betis lost most (7) of 5:0 games, however, they, on the other hand, won 3 of 5:0 games. So the title of the most dominated team goes to Vallecano (6 games lost, none of 5:0 games won).
+
+
+### Number of games played by each team
+There is a saying that the more time you spend doing something the better you become. Let's explore if there is significant correlation between team's number of games played and its overall performance.
+
+```{r EDA_Total_Number_of_Games}
+df_plot_all<-df%>%
+   group_by(Team)%>%
+   #summarise(N=sum(TimeScale))%>%
+   summarise(N=n())%>%
+   arrange(desc(N))
+
+ggplot(df_plot_all, aes(x = reorder(Team,N,max), y = N))+
+   geom_bar(stat="identity",color='orange',alpha=0.7) +
+   xlab("Team") +
+   ylab("Total Number of games played")+
+   coord_flip()
+
+```
+Real Madrid, Barcelona, Athletic Bilbao and Valencia are the oldest teams, each played by the end of 2016 almost 900 games.
+
+Now let's plot the ratio between won/lost/draw games for each team.
+```{r EDA_WLD_Ratios}
+
+df_plot_wdl<-df%>%
+  group_by(Team,Match_Result)%>%
+  summarise(N=n())%>%
+  #summarise(N=sum(TimeScale))%>%
+  ungroup()%>%
+  group_by(Team)%>%
+  mutate(N=N/sum(N))%>%
+  arrange(desc(Match_Result))
+
+
+df_plot_w<-df_plot_wdl%>%
+   filter(Match_Result=="Win")
+
+cols <- c("Win"="green","Lose"="red","Draw"="blue")
+
+ggplot(df_plot_w, aes(x = reorder(Team,N,max), y = N))+
+   geom_bar(stat="identity",color='orange',fill="white",alpha=0.01) +
+   geom_bar(data=df_plot_wdl,aes(fill=as.factor(Match_Result)), stat="identity",alpha=0.5)+
+   scale_fill_manual(name="Result",values=cols)+
+   xlab("Team") +
+   ylab("Ratio")+
+   guides(fill = guide_legend(reverse = T))+
+   coord_flip()
+
+```
+Real Madrid and Barcelona are the most efficient teams winning in ~63% of the cases.
+Corboda and Gimnastic are the exact opposite, losing ~63% of the games they played. 
+
+Now let's check the correlations between number of games played and performance.
+```{r EDA_Number_of_Games_and_Win_Lose_Draw_Correlations}
+df_wdl<-df_plot_wdl%>%
+  spread(Match_Result,N)
+
+df_wdl<-merge(df_wdl,df_plot_all,by="Team")
+
+cor.test(df_wdl$N,df_wdl$Win)
+cor.test(df_wdl$N,df_wdl$Lose)
+cor.test(df_wdl$N,df_wdl$Draw)
+
+colnames(df_wdl)<-c("Team", "Tm_Draw", "Tm_Lose", "Tm_Win","Tm_N")
+
+df_wdl_op<-df_wdl%>%
+  rename(Opponent=Team)
+
+colnames(df_wdl_op)<-c("Opponent", "Op_Draw", "Op_Lose", "Op_Win","Op_N")
+
+```
+There is, indeed, a strong statistically significant correlation between number of games played and total number of games won (0.808) or lost (-0.813). There is, however, no statistically significant correlation for draws (p>0.05). Number of games played can be a good feature to estimate team's chances to win/lose but since we are doing multi-label (win/lose/draw) classification and would like to predict draws too - let's not include it to our list of predictors.
+
+### Distributions of Home vs Away Goals Scored Per Game
+Now let's study the advantage of team playing at home. One way to visualize it is by plotting distribution of goals scored by home teams and overlay it (with some transparency) with distribution of away teams goals.
+
+```{r EDA_Plot II_Home_vs_Away}
+
+cols <- c("True"="#ff7400","False"="#029bf9")
+
+ggplot() +ggtitle('Overlay of Distributions for Home vs Away Team Goals Scored Per Game')+
+   geom_histogram(data=filter(df,Home==T), aes(x=Team_Goals, fill="True"),binwidth=1, colour="black")+
+   geom_histogram(data=filter(df,Home==F), aes(x=Team_Goals, fill="False"),binwidth=1, colour="black",alpha = 0.70)+
+   scale_fill_manual(name="Home?",values=cols)+
+   scale_x_continuous(limits=c(-1, 10),breaks=(seq(-1,10,by=1)))+
+   guides(fill = guide_legend(reverse = TRUE))
+
+```
+From the distributions we can see that on average home team has higher chances, comparing to away team) to score multiple (>1) goals and most often scores at least 1 goal playing at home, with probability of scoring 2 goals being slightly higher than scoring no goals at all.
+The average away team, on the contrary, is almost as likely to score no goals as to score a single goal. The probability of away team and home team scoring 1 goal per game is comparable. This explains why 1:1 is the most probable draw scenario.
+
+Now let's test for statistical significance in the difference we observed using t-test.
+```{r EDA_Average_Home_Advantage}
+mean(df$Team_Goals[(df$Home==TRUE)])-mean(df$Team_Goals[(df$Home==F)])
+t.test(df$Team_Goals[(df$Home==TRUE)],df$Team_Goals[(df$Home==F)])
+
+rm(df_h)
+```
+There is a statistically significant advantage of playing at home, and on average it results in 0.47 goals difference between home and away teams.  
+Interpretation: average home team is more likely to score at least one extra goal compared to average away team. However, home advantage cannot be successfully utilized in all cases and, therefore, difference in means results in a value which is less than 1.
+
+
+There should be at least some variation in how well different teams utilize their home advantage. Let's investigate by plotting how win/lose/draw ratios change for each team when they play at home and away.
+
+```{r EDA_Home_Advantage_Win_Ratio_for_Each_Team}
+
+df_ha<-df%>%
+  group_by(Team,Home,Match_Result)%>%
+  #summarise(N=sum(TimeScale))%>%
+  summarise(N=n())%>%
+  mutate(N=N/sum(N))%>%
+  arrange(desc(Match_Result))
+
+df_pl_w_h<-df_ha%>%
+   filter(Match_Result=="Win"&Home==T)
+df_pl_w_a<-df_ha%>%
+   filter(Match_Result=="Win"&Home==F)
+
+cols <- c("TRUE"="green","FALSE"="blue")
+
+ggplot(df_pl_w_h, aes(x = reorder(Team,N,max), y = N))+
+  geom_bar(stat="identity",aes(fill=Home),alpha=0.65,color='#505957')+
+  geom_bar(data=df_pl_w_a,aes(fill=Home), stat="identity",alpha=.25)+
+  scale_fill_manual(name="Home",values=cols)+
+   xlab("Team") +
+   ylab("Relative Frequency")+
+  ggtitle("Home Advantage. Relative frequency of games won at home vs away") +
+   guides(fill = guide_legend(reverse = T))+
+   coord_flip()
+
+```
+
+```{r EDA_Home_Advantage_Lose_Ratio_for_Each_Team}
+
+df_pl_w_h<-df_ha%>%
+   filter(Match_Result=="Lose"&Home==T)
+df_pl_w_a<-df_ha%>%
+   filter(Match_Result=="Lose"&Home==F)
+
+cols <- c("TRUE"="red","FALSE"="purple")
+
+ggplot(df_pl_w_a, aes(x = reorder(Team,N,min), y = N))+
+  geom_bar(stat="identity",aes(fill=Home),alpha=0.65,color='#505957')+
+  geom_bar(data=df_pl_w_h,aes(fill=Home), stat="identity",alpha=.45)+
+  scale_fill_manual(name="Home",values=cols)+
+   xlab("Team") +
+   ylab("Relative Frequency")+
+  ggtitle("Home Advantage. Relative frequency of games lost at home vs away") +
+   guides(fill = guide_legend(reverse = T))+
+   coord_flip()
+
+```
+
+```{r EDA_Home_Advantage_Draw_Ratio for_Each_Team}
+
+df_pl_w_h<-df_ha%>%
+   filter(Match_Result=="Draw"&Home==T)
+df_pl_w_a<-df_ha%>%
+   filter(Match_Result=="Draw"&Home==F)
+
+cols <- c("TRUE"="blue","FALSE"="purple")
+
+ggplot(df_pl_w_a, aes(x = reorder(Team,N,min), y = N))+
+  geom_bar(stat="identity",aes(fill=Home),alpha=0.65,color='#505957')+
+  geom_bar(data=df_pl_w_h,aes(fill=Home), stat="identity",alpha=0.5)+
+  scale_fill_manual(name="Home",values=cols)+
+   xlab("Team") +
+   ylab("Relative Frequency")+
+  ggtitle("Home Advantage. Relative frequency of draw games at home vs away") +
+   guides(fill = guide_legend(reverse = T))+
+   coord_flip()
+
+```
+The top performers like Real Madrid and Barcelona exhibit outstanding results playing both at home and away. Home advantage, of course, helps both teams to win more games and reduces chances to lose or have a draw, but effect doesn't appear to be so dramatic if compared with other clubs.
+Conversely, there are teams exploiting their home advantage to the fullest like Extremadura, Hercules, Merida, Salamanca and Nuancia performing significantly better at home than away.
+Surprisingly, there are, as well, teams that perform much worse at home than away! Leganes, Lerida and Corboda show noticeably better performance for the ratio of games won playing away. I can only speculate what the actual reason could be, but to be fair to the teams, all of them played less than 50 games total, which might be insufficient to make a solid conclusion about their home vs away performance. 
+
+
+
+
+### Section C. Feautures
+### Time Scale
+Team performance can change over time and is usually affected by a lot of factors.
+Since we are interested in predicting near-future games, current team performance has much more value for us than the results team demonstrated 10 years ago.
+To scale the results - let's add a nonlinear (quadratic) time-scaling factor and multiply outcome of the games and the number of goals team/opponent scored with this factor. To clarify, after scaling, a victory (+1) dated by the 09/05/1993 (earliest date in the observation) - will be equal to extremely small value of +1.382131e-10, whereas the most recent victory in the training dataset (12/19/2016) will have a resulting value of +1.0000235. It's not exactly 1 since a small constant was added to take into account games which were played at the beginning of observation and distinguish them from draws which equal exactly to 0 in our results scale. 
+```{r Features_TimeScale}
+dmax<-as.numeric(max(df$Date))
+dmin<-as.numeric(min(df$Date))
+
+df<-df%>%
+   mutate(TimeScale=((as.numeric(Date)-dmin+0.1)/(dmax-dmin))^2) %>%
+   #mutate(TimeScale=((as.numeric(Date)-dmin)/(dmax-dmin))) %>%
+   mutate(WResult=Result*TimeScale)%>%
+   mutate(Dif_Goals=Team_Goals-Opponent_Goals)%>%
+   mutate(WDif_Goals=Dif_Goals*TimeScale)%>%
+   mutate(WGoals=Team_Goals*TimeScale)%>%
+   mutate(WOpGoals=Opponent_Goals*TimeScale)
+```
+
+### Feautures Engineering 
+To engineer the features we are going to use time-scaled results to capture the picture representing most current teams' performance.  
+As our main feature we will use time-scaled overall performance of each team, calculated as the direct sum of scaled results (wins increase to the metric, loses decrease it and draws are 0 so they do nothing) and divided by the scaled number of games played (most recent games have more weight). We will call it raw estimate of the skill and add it for home team as "Res Skill" and for opponent as "Res Op Skill".  
+From exploratory data analysis we know that there is a home advantage which varies from team to team so let's incorporate it by estimating team performance playing at home and away the same way we quantified raw estimate of the skill above and add it as two additional features: for the team playing at home (Home Skill) and for the opponent team playing away (Away Skill).
+Let's also get average of (time-scaled) number of goals scored by each team at home and away and add them to the features list: as Home Average Goals (HAvGoals) for home team and Away Average Goals (AAvGoals) for the opponent. 
+As extra features let's calculate the differences between:  
+team and opponent estimated raw skills (Res Skill-Res Op Skill); 
+estimate of the home team skill when it plays at home and the skill of the opponent in playing away (Home Skill - Away Skill);
+and the number of average goals scored by home team playing at home and by opponent playing away (HAvGoals-AAvGoals)
+
+```{r Features_Predictors}
+
+df_gr_hm_goals<- df%>%
+   group_by(Team)%>%
+   filter(Home==T)%>%
+   summarise(HT_Av_Goals=mean(Team_Goals))
+
+df_gr_aw_goals<- df%>%
+   group_by(Team)%>%
+   filter(Home==F)%>%
+   summarise(AT_Av_Goals=mean(Team_Goals))%>%
+   rename(Opponent=Team)
+
+df_gr_result<-df%>%
+   group_by(Team)%>%
+   summarise(Res_Skill=sum(WResult)/sum(TimeScale))
+
+df_gr_result_op<-df_gr_result%>%
+   rename(Res_Op_Skill=Res_Skill)%>%
+   rename(Opponent=Team)
+
+df_gr_home<-df%>%
+   group_by(Team,Home)%>%
+   filter(Home==T)%>%
+   summarise(Home_Skill=sum(WResult)/sum(TimeScale))%>%
+   select(-Home)
+
+df_gr_away<-df%>%
+   group_by(Team,Home)%>%
+   filter(Home==F)%>%
+   summarise(Away_Skill=sum(WResult)/sum(TimeScale))%>%
+   rename(Opponent=Team)%>%
+   select(-Home)
+
+
+
+
+df_join<-df_all%>%
+   merge(df_gr_hm_goals, by="Team",all=T)%>%
+   merge(df_gr_aw_goals, by="Opponent",all=T)%>%
+   merge(df_gr_result, by="Team",all=T)%>%
+   merge(df_gr_result_op, by="Opponent",all=T)%>%
+   merge(df_gr_home, by="Team",all=T)%>%
+   merge(df_gr_away, by="Opponent",all=T)%>%
+   mutate(Dif_Res_Skill=Res_Skill-Res_Op_Skill)%>%
+   mutate(Dif_HoAw_Skill=Home_Skill-Away_Skill)%>%
+   mutate(Dif_HoAw_Goals=HT_Av_Goals-AT_Av_Goals)#%>%
+
+
+df_join<-df_join%>%
+  replace(is.na(.), 0)%>%
+  filter(Home==1)%>%
+  mutate(TimeScale=((1+as.numeric(Date)-dmin)/(1+dmax-dmin))^2)
+
+df_join_t<-df_join%>%
+   filter(Date<cutoff_date)
+```
+
+### Teams' Averaged Skill 
+
+Let's plot teams' averaged skill estimate (Res Skill) and compare the results with common knowledge about LaLiga teams.
+```{r Features_Res_Skill_Distribution }
+df_plotsk<-df_gr_result
+#df_plotsk<-df_gr_goals
+
+df_plotsk$Team<-factor(df_plotsk$Team, levels=df_plotsk$Team[order(df_plotsk$Res_Skill)]) 
+
+
+ggplot(df_plotsk, aes(x=Team, y=Res_Skill,fill=Res_Skill)) + 
+   geom_bar(stat="identity") + 
+   coord_flip()+
+   scale_fill_gradient(low="#F30000",high="#00F802")
+rm(df_plotsk)
+
+```
+As expected, Real Madrid and Barcelona turn out to be the best performing teams! Followed by Atletico Madrid, Sevilia, Valencia and Villareal. On the bottom of the list are Lorgones and Corboda, which, in fact, are known to perform quite poorly. Sorry Murica and Corboda fans! These teams might win the championship one day.
+
+### Feautures/Result correlations
+
+Let's test which of the features we created correlate the most with the game's result. Since result is a categorical variable (win (+1), draw (0), defeat (-1)) we would need to use poly-serial correlation.
+
+```{r Features_Result_Corrleations}
+library(polycor)
+
+df_join_t$Result<-as.factor(df_join_t$Result)
+levels(df_join$Result)<-c("lose","draw","win")
+
+
+hc<-vector()
+
+hc[1]<-hetcor(df_join_t$Res_Skill,df_join_t$Result)$correlations[1,2]
+hc[2]<-hetcor(df_join_t$Res_Op_Skill,df_join_t$Result)$correlations[1,2]
+
+hc[3]<-hetcor(df_join_t$Home_Skill,df_join_t$Result)$correlations[1,2]
+hc[4]<-hetcor(df_join_t$Away_Skill,df_join_t$Result)$correlations[1,2]
+
+hc[5]<-hetcor(df_join_t$HT_Av_Goals,df_join_t$Result)$correlations[1,2]
+hc[6]<-hetcor(df_join_t$AT_Av_Goals,df_join_t$Result)$correlations[1,2]
+
+hc[7]<-hetcor(df_join_t$Dif_Res_Skill,df_join_t$Result)$correlations[1,2]
+hc[8]<-hetcor(df_join_t$Dif_HoAw_Skill,df_join_t$Result)$correlations[1,2]
+hc[9]<-hetcor(df_join_t$Dif_HoAw_Goals,df_join_t$Result)$correlations[1,2]
+
+hcd<-data.frame(feautures=c("Res_Skill","Res_Op_Skill","Home_Skill","Away_SKill","HT_Av_Goals","AT_AvGoals","Dif_Res_Skill","Dif_HoAw_Skill","Dif_HoAw_Goals"), Result_Correlation=hc)
+
+hcd
+rm(hc)
+```
+Correlations of individual features and games' results are actually not that low (above 20%). This is a good indicator that ML algorithms should be able to find hidden inter-connections between features and results and predict outcomes, at least, better than simply choosing the majority class (home team wins). Taking a difference between skills or average number of goals scored by home and away teams increases correlation to ~37%. So differences will most likely demonstrate to be more important features. We can extract estimated features importance for algorithms which allow that.
+
+Let's additionally test for correlations between the difference of team and opponent goals scored in each game and features we designed to train ML algorithms on. 
+
+```{r Feautures_Finalgoals_Correlation}
+final_goals<-df_join_t$Team_Goals-df_join_t$Opponent_Goals
+
+cor.test(final_goals, df_join_t$Dif_HoAw_Skill)
+cor.test(final_goals, df_join_t$Dif_Res_Skill)
+cor.test(final_goals, df_join_t$Dif_HoAw_Goals)
+
+```
+Difference in goals is moderately (~38%) correlated with the differences in skill and number of goals each team scores on average. The result is promising in case we want to predict the most possible spread in goals.  
+
+
+### Section D. Machine Learning
+
+Before we start training models, let's prepare 3 data sets:
+"df_train" to train and tune hyper-parameters of the models
+"df_valid" to validate the resulting model
+and "df_test" for final estimation of models' accuracy and expected ROIs.
+Since we would like to predict outcome of every game as accurate as possible - let's try to prevent ML algorithms from choosing the "easiest" solution of ignoring one of the classes (usually the hardest to predict) completely. To show to ML algorithms that all classes are equally important we can either add higher weights for misclassification for misrepresented class in algorithms which accept weights or balance the classes using up-sampling or down-sampling. We will go with down-sampling. 
+However, we will down-sample only the training set, test and validation sets will be left intact, i.e. both of them having their original distribution of classes (game results).
+```{r ML_prepare_data}
+df_joined<-df_join
+
+df_joined$Result<-as.factor(df_joined$Result)
+levels(df_joined$Result)<-c("lose","draw","win")
+
+train_date<-as.Date("2016/09/01")
+valid_date<-as.Date("2017/03/15")
+
+df_train<-df_joined%>%
+   filter(Date<cutoff_date&Date>=train_date)
+
+set.seed(12345)
+df_train<-downSample(df_train[,-which(colnames(df_train)=="Result")],df_train$Result,yname="Result")
+
+df_valid<-df_joined%>%
+   filter(Date>=cutoff_date&Date<=valid_date)
+
+df_test<-df_joined%>%
+   filter(Date>valid_date)
+
+```
+
+Separating features and labels.
+```{r ML_select_featurues}
+
+xc<-df_train%>%
+  select(-Home,-Result,-Date,-Team_Goals,-Opponent_Goals,-Total_Goals,-TimeScale,-Team,-Opponent,-Match_Result,-Div)
+
+yc<-df_valid%>%
+  select(-Home,-Result,-Date,-Team_Goals,-Opponent_Goals,-Total_Goals,-TimeScale,-Team,-Opponent,-Match_Result,-Div)
+
+zc<-df_test%>%
+  select(-Home,-Result,-Date,-Team_Goals,-Opponent_Goals,-Total_Goals,-TimeScale,-Team,-Opponent,-Match_Result,-Div)
+
+
+xc<-as.matrix(xc)
+yc<-as.matrix(yc)
+zc<-as.matrix(zc)
+
+
+z<-df_train$Result
+zz<-df_valid$Result
+zzz<-df_test$Result
+```
+
+### Naive Bayes
+Let's start with Naive Bayes- a simple model which still, however, can generate very satisfying results. We will run it on the entire training dataset without any cross-validation and test the model using validation set.
+```{r NaiveBayes}
+
+nb_class <- naiveBayes(x=xc,y=z)
+yc.predicted <- predict(nb_class, yc, type="class")
+
+dm<-confusionMatrix(yc.predicted,zz)
+dm$overall
+dm$table
+dm$byClass
+
+```
+54% accuracy with kappa=0.26 - not bad for the first straightforward try! Taking into account that null accuracy of validation set is 48%, which corresponds to the percentage of the majority class, our model did 6% better, that's a promising start. 
+
+Although the training dataset was balanced in terms of classes, it appears that draws are quite hard to predict correctly (only 15% sensitivity with 88% specificity). Most likely until we add additional information about the games (weather conditions, which players in both teams will not be playing due to injuries or accumulated red/yellow cards, recent transfers, e.t.c) draws will remain tough to foresee. 
+
+### Elastic-Net Regularized Generalized Linear Models (GLMNET)
+Next let's see how Lasso and Elastic-Net Regularized Generalized Linear Models (glmnet) will perform. To make sure our model generalizes well - we will do repeated cross-validation to tune model's hyperparametrs and then test best performing model on the validation set. 
+
+But before we proceed, in order for the results to be reproducible, we would have to create seeds for each iteration of resampling. We have to use seeds and not set.seed because we are using parallel processing. Since there are multiple workers (Rscripts instances) plowing through parameters tune space independently from each other - specifying single seed won't work.  
+
+We will have to provide a vector of lists which has a specific size. This size is equal to number of resamlpings (in our case its 3 repeats of 10-fold cross-validation = 30) plus 1 for the final model. Each element of the vector should contain a list of seeds as long as number of combinations one had in his/her parameter tuning grid. The tuning grid i used had 11 parameters for alpha and 41 parameter for lambda or total of 451 unique combinations. Last vector's element (for final model) may contain only a single seed, since by that point the best parameters were already selected.
+
+Creating the seeds vector:
+```{r glmnet_setseeds}
+seeds <- vector(mode = "list", length = 30+1)
+set.seed(1234)
+for(i in 1:(length(seeds)-1)) {
+   seeds[[i]]<- sample.int(n=10000, 451)
+}
+set.seed(1234)
+#for the last model
+seeds[[length(seeds)]]<-sample.int(10000, 1)
+
+```
+All set, let's train it!
+```{r glmnet}
+
+cv.ctrl <- trainControl(method = "repeatedcv", repeats = 3,number = 10,
+                        seeds = seeds,
+                        summaryFunction = multiClassSummary,
+                        allowParallel=T
+                        )
+
+glmnet.grid <- expand.grid(.alpha=0:10*0.1,
+                           #.alpha=0,
+                           .lambda=0:40*0.5)
+
+glmnet_tune <-train(x=xc,
+                     y=z,
+                     method="glmnet",
+                     family="multinomial",
+                     #standardize=T,
+                     #type.multinomial = "grouped",
+                     trControl=cv.ctrl,
+                     tuneGrid=glmnet.grid,
+                     #metric="Kappa",
+                     metric="Accuracy"
+                    )
+ggplot(glmnet_tune,highlight = T)
+
+glmnet_tune$bestTune
+glmnet_tune.pred<-predict(glmnet_tune,yc)
+
+glmnet_tune_dm<-confusionMatrix(glmnet_tune.pred,zz)
+glmnet_tune_dm$overall
+glmnet_tune_dm$table
+glmnet_tune_dm$byClass
+
+#stopCluster(cl); registerDoSEQ();
+
+```
+The graph above represents an estimate of how well the model with different hyper-parameters will generalize to unseen dataset. Since training was done on a balanced set - null accuracy for training dataset is 33%. All mixtures between lasso (alpha=1) and ridge (alpha=0) can achieve accuracy which is much higher than that, at least for low penalty strength (lambda). The best performing pair of parameters is marked with a diamond and corresponds to ridge regression model (alpha=0) with penalty parameter lambda of 11.5.
+Glmnet shows improved performance on validation set (56%) comparing to straight-forward Naive Bayes (54%). It predicts more of lost games correctly, hence the increase in accuracy. 
+Algorithm, however, "favors" draws even less, deciding to make less draw predictions on validation set, but, at the same time, guessing correctly only 1 draw less than Naive Bayes.  
+
+Glmnet allows extracting an estimation on features' importance. It can provide additional insights for advanced feature engineering or dimensionality reduction.
+```{r glmnet_features_importance}
+
+varImp(glmnet_tune)
+
+```
+Opponent's skill at playing away appears to be the most important feature for predicting if home team is going to lose, followed closely by opponent's raw skill estimate (Res_Op_Skill) and difference between home team's skill of playing at home and opponents away skill.  
+For predicting wins - the most important features are: home skill, raw estimate of opponent's and home skills, and, as well, difference in raw estimates of the skill.   
+For win and lose predictions average number of goals scored by opponent playing away (AT_Av_Goals) seems to matter more than average number of goals scored by home team playing at home (HT_Av_Goals).  
+For draws - away skill matters the most, however it's estimated importance is significantly less than importance for majority of features in win or lose predictions. This is a possible indicator that current features are quite bad for predicting draws. Which partially could be the consequence of our choice for scaling results between -1, 0, +1 with draws = 0 which is not a unique value, since, for example, the sum of the most recent win and lose will be equal to 0 as well. In the next iteration of the prototype we can try to rethink the the scale to include draws as distinct entities.
+
+### Regularized SVM
+Now let's train and test our next candidate - regularized support vector machines with linear kernel.
+As for glmnet we will have to specify the seeds first.
+```{r svm_setseeds}
+seeds <- vector(mode = "list", length = 30+1)
+set.seed(1234)
+for(i in 1:(length(seeds)-1)) {
+   seeds[[i]]<- sample.int(n=1000, 202)
+}
+set.seed(1234)
+#for the last model
+seeds[[length(seeds)]]<-sample.int(1000, 1)
+
+```
+
+And then let it train and choose best hyperparamters using repeated cross-validation:
+```{r svm}
+library(kernlab)
+ctrl <- trainControl(method="repeatedcv",
+                     number=10,
+                     repeats = 3,
+                     seeds = seeds,
+                     #summaryFunction = multiClassSummary,
+                     allowParallel = T)
+
+
+svmRGrid<-expand.grid(.cost=0:100*0.10,
+                      .Loss=c("L1","L2"))
+
+
+svmRFit<-train(x=xc,y=z,
+               tuneGrid=svmRGrid,
+               method="svmLinear3",
+               metric="Accuracy",
+               trControl=ctrl)
+
+     
+ggplot(svmRFit, highlight = T)
+svmRFit$bestTune
+
+yc.predicted<-predict(svmRFit,yc, type="raw")
+svm_dm<-confusionMatrix(yc.predicted,zz)
+svm_dm$overall
+svm_dm$table
+svm_dm$byClass
+
+```
+
+
+L2 loss function with inverse of regularization parameter (cost) of 1.5 performed the best during repeated cross-validation at ~52% accuracy vs 33% base accuracy.
+Accuracy on validation set is similar to glmnet, but, as can be seen, it tends to ignore the draw class completely. Well, it's not ideal, of course, but all previous models had problems with predicting draws as well, so let's wait for estimation of its performance on test dataset.
+
+### Multi-layer Perceptron
+Let's use multi-layer perceptron (mlp) with a decay parameter as our next model.
+
+Setting seeds:
+```{r tune_setseeds}
+seeds <- vector(mode = "list", length = 30+1)
+set.seed(1234)
+for(i in 1:(length(seeds)-1)) {
+   seeds[[i]]<- sample.int(n=10000, 105)
+}
+set.seed(1234)
+#for the last model
+seeds[[length(seeds)]]<-sample.int(10000, 1)
+
+```
+
+Training:
+```{r tune}
+cv.ctrl <- trainControl(method = "repeatedcv", repeats = 3,number = 10,
+                        seeds = seeds,
+                        #summaryFunction = multiClassSummary,
+                        allowParallel=T
+                        )
+
+
+tune.grid <- expand.grid(.size=1:5,
+                         .decay=0:20*(1e-4))
+
+
+
+tune <-train(x=xc,
+                     y=z,
+                     method="mlpWeightDecay",
+                     trControl=cv.ctrl,
+                     tuneGrid=tune.grid,
+                     metric="Accuracy"
+                     #metric="Kappa"
+                    )
+ggplot(tune,highlight = T)
+tune$bestTune
+
+#library(plyr)
+#library(dplyr)
+#detach("package:caret", unload=TRUE)
+#library(caret)
+tune.pred<-predict(tune,yc,type="raw")
+#tune.predicted<-colnames(tune.pred)[max.col(tune.pred,ties.method="first")]
+
+tune_dm<-caret::confusionMatrix(tune.pred,zz)
+tune_dm$overall
+tune_dm$table
+tune_dm$byClass
+```
+Mlp performed the worst on validation data out of all models tested, however, it tried to predict the most number of draws and got the highest number of them correctly. So if we create an ensemble of glmnet, regularized svm and mlp - mlp should be able counter-weight SVM which doesn't bother to predict any draws on validation set.
+
+### Ensemble
+Let's create a simple voting ensemble where each model has an equal vote. Outcome is chosen by the majority of votes. 
+```{r class_voting}
+class_voting <- function(mod1, mod2, mod3, test.dat){
+   
+   dat<-test.dat
+
+    xb1 <- predict(mod1, dat, type="raw")
+    xb2 <- predict(mod2, dat, type="raw")
+    xb3 <- predict(mod3, dat, type="raw")
+   
+    
+    epr<-data.frame(N=1:length(xb1),xb1,xb2,xb3)%>%
+      gather(num,Predictions,-N)%>%
+      dplyr::select(-num)%>%
+      group_by(N)%>%
+      count(Predictions)%>%
+      slice(which.max(n))
+
+   epr.predicted<-epr$Predictions
+   return(epr.predicted)
+}
+```
+Let's test it on validation set.
+```{r class_voting_valid}
+epr.predicted<-class_voting(glmnet_tune,tune,svmRFit,yc)
+
+edm<-caret::confusionMatrix(epr.predicted,zz)
+
+edm$overall
+edm$table
+edm$byClass
+
+```
+55% accuracy - overall decrease comparing to glmnet and svm. But still higher than the accuracy of the lowest performing model - mlp.
+
+### Accuracy on test data
+Now since we have well performing models - let's test them on test data for final estimate of their accuracy.
+
+Starting with glmnet
+```{r}
+glmnet.final.pred<-predict(glmnet_tune,zc,type="raw")
+
+glmnet_cm_final<-caret::confusionMatrix(glmnet.final.pred,zzz)
+glmnet_cm_final$overall
+glmnet_cm_final$table
+glmnet_cm_final$byClass
+```
+60% accuracy at 49% null accuracy - quite good!
+
+Now let's see how svm performs
+```{r}
+svmRFit.final.pred<-predict(svmRFit,zc, type="raw")
+
+svmR_pr_final<-caret::confusionMatrix(svmRFit.final.pred,zzz)
+svmR_pr_final$overall
+svmR_pr_final$table
+svmR_pr_final$byClass
+```
+Svm model shows the same accuracy (60%) - but with no draws predicted. 
+
+Let's see how mlp will do:
+```{r }
+tn.final.pred<-predict(tune,zc,type="raw")
+
+tn_pr_final<-caret::confusionMatrix(tn.final.pred,zzz)
+tn_pr_final$overall
+tn_pr_final$table
+tn_pr_final$byClass
+```
+61%! Wow! Mlp pleasantly surprised, outperforming svm and glment on final test data, correctly predicting good number (relatively to previous results) of draws (30% sensitivity) . A dark horse of our mini ML racing indeed.
+
+Let's see if ensemble of the models will do better than any of the models individually: 
+```{r}
+
+classv.final.predicted<-class_voting(glmnet_tune,tune,svmRFit,zc)
+
+classv_cm_final<-caret::confusionMatrix(classv.final.predicted,zzz)
+classv_cm_final$overall
+classv_cm_final$table
+classv_cm_final$byClass
+
+```
+It does indeed! We got 1% improve in accuracy! Exciting!
+
+### Models' Correlation
+Let's investigate why ensemble could have improved performance. For that, we will use caretEnsemble to train all of the models simultaneously and find out how models correlate to each other.
+```{r}
+library(caretEnsemble)
+seed<-1234
+control <- trainControl(method="repeatedcv", 
+                        number=10, 
+                        repeats=3,
+                        savePredictions="final" 
+                        #classProbs=TRUE
+                        )
+
+#algorithmList <- c('mlpWeightDecay','glmnet','svmLinear3')
+tuneList=list(
+    glmnet=caretModelSpec(method="glmnet", tuneGrid=data.frame(.alpha=0,.lambda=8.5)),
+    mlpWD=caretModelSpec(method="mlpWeightDecay", tuneGrid=data.frame(expand.grid(.size=2 ,.decay=1e-4))),
+    svmLin=caretModelSpec(method="svmLinear3", tuneGrid=data.frame(expand.grid(.cost=1.5, .Loss="L2")))
+  )
+set.seed(seed)
+models <- caretList(x=xc, y=z, 
+                    trControl=control, 
+                    #methodList=algorithmList,
+                    tuneList=tuneList
+                    )
+results <- resamples(models)
+#summary(results)
+dotplot(results)
+
+modelCor(results)
+#splom(results)
+```
+For boosting to work the best models should perform roughly the same. Which holds true for our models (graph for models vs accuracy and kappa estimates on training data)
+Boosting also requires models with low correlation to each other. The less the correlation the more the improvement in accuracy. In our case correlations are in 66-75% range which, of course, is relatively high but, nevertheless, due to models "having" different opinion in some of the cases - voting worked.  
+Adding to our boosting ensemble models which are less correlated to any of the existing once but still have similar performance can further improve the accuracy. Additionally, using probabilities for each model that allows it as weights in the voting (higher probability - higher confidence - more votes) shall further improve the boosting ensemble approach. 
+
+
+Now, since every project, in my opinion, should generate useful outcomes - let's use our algorithms and quantify possible earnings in case if we would actually placed the bets following algorithms' generated predictions. For that we will load additional dataframe containing odds by various online sports bookmakers. We will pretend we did a small $10 bet at all of them for every game and count our profits as money made - money invested. ROI is calculated as profits/money invested
+
+```{r bookmaker}
+bookmaker_odds<-read.csv("Odds/sp1.csv",header = T)%>%
+   rename(Team=HomeTeam,Opponent=AwayTeam)%>%
+   select(Team,Opponent,Date,FTR,B365H:VCA)
+
+bookmaker_odds$Date<-as.Date(bookmaker_odds$Date,"%d/%m/%y")
+bookmaker_test<-bookmaker_odds%>%
+   filter(Date>=valid_date)
+
+bmt<-merge(df_test,bookmaker_test,by=c("Team","Opponent","Date"), all=T)
+   
+df_bmt<-bmt%>%
+   select(HT_Av_Goals:Dif_HoAw_Goals)
+zbmt<-bmt$Result
+
+odds_bmt<-bmt%>%
+   select(Result,B365H:VCA)
+
+```
+
+Now let's create return on interest function (ROI), which will quantify money won/lost, profits made, and estimate ROI based on model's predictions and size of the bet. 
+```{r ROI_function}
+
+ROI_fun<-function(bmt_pred, bet){
+odds_bmt$pred<-bmt_pred
+
+bmt_mwon<-odds_bmt%>%
+   filter(Result==pred)
+bmt_mlost<-odds_bmt%>%
+   filter(Result!=pred)
+
+bms<-bmt_mwon%>%
+   select(-Result,-pred)
+
+na_rep<-median(as.matrix(na.omit(bms)))
+
+bms[is.na(bms)]<-na_rep
+
+for (i in 1:nrow(bmt_mwon)){
+   if (bmt_mwon$Result[i]=="draw"){
+      bmt_mwon$cashback[i]<-sum(bms[i,seq(2, (ncol(bms)), 3)]*bet)
+   }
+   if (bmt_mwon$Result[i]=="win"){
+      bmt_mwon$cashback[i]<-sum(bms[i,seq(1, (ncol(bms)), 3)]*bet)
+   }
+    if (bmt_mwon$Result[i]=="lose"){
+      bmt_mwon$cashback[i]<-sum(bms[i,seq(3, (ncol(bms)), 3)]*bet)
+   }
+}
+
+investment<-7*bet*nrow(bmt)
+money_won<-sum(bmt_mwon$cashback)
+avg_money_won<-money_won/nrow(bmt_mwon)-7*bet
+#money_lost<-70*nrow(bmt_mlost)
+ROI<-(money_won-investment)/investment
+profit<-(money_won-investment)
+#cm_bmt<-confusionMatrix(bmt_pred,zbmt)
+#cm_bmt$overall
+return<-money_won
+ROI_res<-data.frame(investment,return,profit,ROI)
+return(ROI_res)
+
+}
+```
+
+Now we will do the simulation and calculate ROIs for each model: making 10 dollar bet at every bookmaker for every LaLiga game played since 03/15/17 till 05/21/17 (total of 111 games).
+```{r ROIs}
+bmt_pred1<-predict(glmnet_tune,df_bmt,type="raw")
+bmt_pred2<-predict(svmRFit,df_bmt,type="raw")
+bmt_pred3<-predict(tune,df_bmt,type="raw")
+bmt_pred4<-class_voting(tune,glmnet_tune,svmRFit,df_bmt)
+
+d1<-ROI_fun(bmt_pred1,bet=10)
+d2<-ROI_fun(bmt_pred2,bet=10)
+d3<-ROI_fun(bmt_pred3,bet=10)
+d4<-ROI_fun(bmt_pred4,bet=10)
+
+ROI_results<-bind_rows(d1,d2,d3,d4)
+ROI_results$model<-c("glmnet","reg_SVM","mlp","ensemble")
+ROI_results%>%
+   select(model,investment,return,profit,ROI)
+```
+Wow! 13% ROI for ensemble voting model! Making make me $1000 in roughly just two months. Time to buy fleece vests and start my own hedge-fund!
+Svm betting on its own performed the worst making me only $605 or generating ~8% ROI.
+glmnet did slightly better earning extra 97 bucks comparing to svm and producing ~9% ROI.
+mlp is the best betting model winning me $916 resulting in ~12% ROI
+
+### Conclusion
+Machine learning and proper feature engineering can, in fact, make you money in sports betting domain. Such high (13%) ROI could, of course, arise out of pure luck due to some unknown factors. There was, for example, a slight increase in number of games won for the selected time range comparing to all-time average. And, it is definitely possible that the yearly averaged ROI can turn out to be much more humble. But it's betting after all so some risks are unavoidable. Nevertheless, there are (always!) ways to further decrease risks, get proper estimate on expected ROI and, hopefully, a way to boost profits and ROI to even higher values. But, since I already ordered fleece jackets, I should not probably reveal any further.
+Stay tuned, however, for updates about how real money betting is going to turn out.
+
