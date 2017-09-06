@@ -1,5 +1,5 @@
 ---
-title: "LaLiga Soccer Games Outcome Prediction Report"
+title: "LaLiga Soccer Games Outcome Prediction"
 author: "by Denis Sharoukhov, PhD"
 date: "Aug 24, 2017"
 output:
@@ -15,18 +15,21 @@ knitr::opts_chunk$set(echo = TRUE, eval = TRUE, warnings = FALSE,
 ```
 
 ### Introduction
-The goal of this project was to asses financial viability of applied machine learning in sports betting domain. For prototyping and training of machine learning algorithms historical data for soccer games played in LaLiga division (since 1993) was used. Betting odds of the most recent games in the (since 03/15/17 till) were used to estimate Return on Investment (ROI). Best models demonstrate 8 to 13% ROI using features engineered by calculating simple statistics representing time-weighted performance of each team including average number of goals scored playing at home and away, normalized difference in number of games won/lost and their derivatives. Models hyper-parameters were tuned on training dataset using caret package and repeated cross-validation. Validation data was used to choose best performing models. Best models were presented with untouched test dataset to get final estimation of their performance and calculate ROI using betting odds.
+The goal of this project was to asses financial viability of applied machine learning in sports betting domain. For prototyping and training of machine learning algorithms historical data for soccer games played in LaLiga division (since 1993) was used. Betting odds of the most recent games from 03/15/17 till 05/21/17 were used to estimate Return on Investment (ROI).  
+Best models demonstrated 8 to 13% ROI using features engineered by calculating simple statistics which represent time-weighted performance of each team and include: average number of goals scored, average number of goals scored playing at home and away, average number of games won/lost and some of their derivatives.  
+Models' hyper-parameters were tuned on training dataset using caret package and repeated cross-validation. Validation data was used to select best performing models.  
+At the end best models were presented with untouched test dataset to get final estimation of their performance and calculate ROI using betting odds.  
 Selected models: Lasso and Elastic-Net Regularized Generalized Linear Models (glmnet), Regularized Support Vector Machines with linear kernel(LiblineaR), Multi-layer Perceptron (RSNNS) and their simple voting ensemble.
 
 
 ### Libraries
-List of libraries used in this project (keep updating list)
+List of libraries used in this project:
 ```{r Load_Libraries}
 library(plyr);
 library(dplyr);library(tidyr);library(caret)
 library(class); library(e1071);library(ggplot2)
-library(glmnet)
-library(doParallel)
+library(glmnet); library(polycor); library(kernlab)
+library(doParallel); library(caretEnsemble)
 ```
 
 Enable parallel processing on Windows, using doParallel library:
@@ -51,7 +54,7 @@ setwd("C:/Projects/Portfolio/LaLiga-Soccer-Games-Prediction")
 ### Section A. Data Preparation
 
 ### Loading raw data
-Let's start with reading csv files downloaded from [football-data.co.uk](http://www.football-data.co.uk/spainm.php). Each file contains results for separate seasons played since 1993. Let's combine them into a single dataframe.
+Let's start with reading csv files downloaded from [football-data.co.uk](http://www.football-data.co.uk/spainm.php). Each file contains results for individual seasons played since 1993. Let's combine them into a one big dataframe.
 
 ```{r Data_Load, eval=TRUE}
 
@@ -76,7 +79,7 @@ rm(sp)
 
 ```
 ### Data Cleaning 
-Let's turn "Date" column from character to date format, and rename "Home and Away Goals" columns. Additionally, to make data munging easier for the next step we will remove "Result" column. This information can be easily restored using difference between home and away team's goals.
+Now let's turn "Date" column from character to date format, and rename "Home and Away Goals" columns. Additionally, to make data munging easier let's remove "Result" column. This information can be easily restored using difference between home and away team's goals.
 
 ```{r Data_Clean_Up}
 
@@ -148,7 +151,7 @@ df_testing<-df_all%>%
 ```
 
 ### Section B. Exploratory Data Analysis
-Data is now in the "tidy" form: each row corresponds to a separate observation and each column represents either a variable or the match result.
+Data is in the "tidy" form now: each row corresponds to a separate observation and each column represents either a variable or the match result.
 We can proceed to exploratory data analysis; let's start with quantifying the ratio of games resulted in draw, victory or defeat.  
 
 ```{r EDA_Win_Loss_vs_Draw}
@@ -169,7 +172,7 @@ cat("Wins:",nrow(filter(df_h,Result==1)),"\n","Ratio:", nrow(filter(df_h,Result=
 #gc()
 ```
 On average, home team wins 48% of the time and loses 26% of all games. About 26% of all games end up as the draw. 
-Home team wins in less than 50% of the cases so, without taking any bet odds into account, always betting on the home team winning already seems to be far from an ideal strategy.
+Home team wins in less than 50% of the cases, so, without taking any bet odds into account, always betting on the home team winning is far from an ideal strategy.
 For us, however, it is more important that there is an imbalance between the classes: wins of the home team are much more abundant than draws or loses, so we need to keep that in mind when training classification models.
 
 ### Distribution of Total (Both Teams) Goals Scored Per Game 
@@ -229,7 +232,7 @@ df_expl<-df%>%
 df_expl
 
 ```
-The winning team scoring 2 goals and losing team scoring only 1 goal is the most probable scenario (71% of all cases) for 3-goals games. However, games where winning team did not allow opponent to score at all are not that uncommon and correspond to 29% of all cases.  
+The winning team scoring 2 goals and losing team scoring only 1 goal is the most probable scenario (71% of all cases) for 3-goals games. However, games where winning team did not allow opponent to score any goal at all are not that uncommon and correspond to 29% of all cases.  
 
 For 4-goals games (draws are not included) the ratios are the same: 71% of 3:1 games and 29% of 4:0 games.  
 
@@ -366,8 +369,8 @@ ggplot() +ggtitle('Overlay of Distributions for Home vs Away Team Goals Scored P
    guides(fill = guide_legend(reverse = TRUE))
 
 ```
-From the distributions we can see that on average home team has higher chances, comparing to away team) to score multiple (>1) goals and most often scores at least 1 goal playing at home, with probability of scoring 2 goals being slightly higher than scoring no goals at all.
-The average away team, on the contrary, is almost as likely to score no goals as to score a single goal. The probability of away team and home team scoring 1 goal per game is comparable. This explains why 1:1 is the most probable draw scenario.
+From the distributions we can see that on average home team has higher chances (comparing to away team) to score multiple (>1) goals and most often scores at least 1 goal playing at home, with probability of scoring 2 goals being slightly higher than scoring no goals at all.
+The average away team, on the contrary, is almost as likely to score no goals as to score a single goal. The probability of away team and home team scoring 1 goal per game is comparable. This can explain why 1:1 is the most probable draw scenario.
 
 Now let's test for statistical significance in the difference we observed using t-test.
 ```{r EDA_Average_Home_Advantage}
@@ -462,7 +465,7 @@ Surprisingly, there are, as well, teams that perform much worse at home than awa
 ### Time Scale
 Team performance can change over time and is usually affected by a lot of factors.
 Since we are interested in predicting near-future games, current team performance has much more value for us than the results team demonstrated 10 years ago.
-To scale the results - let's add a nonlinear (quadratic) time-scaling factor and multiply outcome of the games and the number of goals team/opponent scored with this factor. To clarify, after scaling, a victory (+1) dated by the 09/05/1993 (earliest date in the observation) - will be equal to extremely small value of +1.382131e-10, whereas the most recent victory in the training dataset (12/19/2016) will have a resulting value of +1.0000235. It's not exactly 1 since a small constant was added to take into account games which were played at the beginning of observation and distinguish them from draws which equal exactly to 0 in our results scale. 
+To scale the results - let's introduce a nonlinear (quadratic) time-scaling factor and multiply outcome of the games and the number of goals team/opponent scored with it. To clarify, after scaling, a victory (+1) dated by the 09/05/1993 (earliest date in the observation) - will be equal to extremely small value of +1.382131e-10, whereas the most recent victory in the training dataset (12/19/2016) will have a resulting value of +1.0000235. It's not exactly 1 since a small constant was added to take into account games which were played at the beginning of observation and distinguish them from the draws which equal to 0 exactly in our results scale. 
 ```{r Features_TimeScale}
 dmax<-as.numeric(max(df$Date))
 dmin<-as.numeric(min(df$Date))
@@ -478,7 +481,7 @@ df<-df%>%
 ```
 
 ### Feautures Engineering 
-To engineer the features we are going to use time-scaled results to capture the picture representing most current teams' performance.  
+To engineer the features we are going to use time-scaled results in order, as was mentioned above, to capture the picture representing the most current teams' performance.  
 As our main feature we will use time-scaled overall performance of each team, calculated as the direct sum of scaled results (wins increase to the metric, loses decrease it and draws are 0 so they do nothing) and divided by the scaled number of games played (most recent games have more weight). We will call it raw estimate of the skill and add it for home team as "Res Skill" and for opponent as "Res Op Skill".  
 From exploratory data analysis we know that there is a home advantage which varies from team to team so let's incorporate it by estimating team performance playing at home and away the same way we quantified raw estimate of the skill above and add it as two additional features: for the team playing at home (Home Skill) and for the opponent team playing away (Away Skill).
 Let's also get average of (time-scaled) number of goals scored by each team at home and away and add them to the features list: as Home Average Goals (HAvGoals) for home team and Away Average Goals (AAvGoals) for the opponent. 
@@ -522,8 +525,6 @@ df_gr_away<-df%>%
    select(-Home)
 
 
-
-
 df_join<-df_all%>%
    merge(df_gr_hm_goals, by="Team",all=T)%>%
    merge(df_gr_aw_goals, by="Opponent",all=T)%>%
@@ -547,7 +548,7 @@ df_join_t<-df_join%>%
 
 ### Teams' Averaged Skill 
 
-Let's plot teams' averaged skill estimate (Res Skill) and compare the results with common knowledge about LaLiga teams.
+For sanity check - let's plot teams' averaged skill estimate (Res Skill) and compare the results with common knowledge about LaLiga teams.
 ```{r Features_Res_Skill_Distribution }
 df_plotsk<-df_gr_result
 #df_plotsk<-df_gr_goals
@@ -562,14 +563,13 @@ ggplot(df_plotsk, aes(x=Team, y=Res_Skill,fill=Res_Skill)) +
 rm(df_plotsk)
 
 ```
-As expected, Real Madrid and Barcelona turn out to be the best performing teams! Followed by Atletico Madrid, Sevilia, Valencia and Villareal. On the bottom of the list are Lorgones and Corboda, which, in fact, are known to perform quite poorly. Sorry Murica and Corboda fans! These teams might win the championship one day.
+As expected, Real Madrid and Barcelona turn out to be the best performing teams! Followed by Atletico Madrid, Sevilia, Valencia and Villareal. On the bottom of the list are Lorgones and Corboda, which are known to perform quite poorly. Sorry Murica and Corboda fans! These teams might win the championship one day.
 
 ### Feautures/Result correlations
 
 Let's test which of the features we created correlate the most with the game's result. Since result is a categorical variable (win (+1), draw (0), defeat (-1)) we would need to use poly-serial correlation.
 
 ```{r Features_Result_Corrleations}
-library(polycor)
 
 df_join_t$Result<-as.factor(df_join_t$Result)
 levels(df_join$Result)<-c("lose","draw","win")
@@ -595,7 +595,7 @@ hcd<-data.frame(feautures=c("Res_Skill","Res_Op_Skill","Home_Skill","Away_SKill"
 hcd
 rm(hc)
 ```
-Correlations of individual features and games' results are actually not that low (above 20%). This is a good indicator that ML algorithms should be able to find hidden inter-connections between features and results and predict outcomes, at least, better than simply choosing the majority class (home team wins). Taking a difference between skills or average number of goals scored by home and away teams increases correlation to ~37%. So differences will most likely demonstrate to be more important features. We can extract estimated features importance for algorithms which allow that.
+Correlations of individual features and games' results are actually not that low (above 20%). This is a good indicator that ML algorithms should be able to find hidden inter-connections between features and results and predict outcomes, at least, better than simply choosing the majority class (home team wins). Taking a difference between skills or average number of goals scored by home and away teams increases correlation to ~37%. So differences will most likely demonstrate to be more important features. We can actually extract estimated features importance for algorithms which allow that.
 
 Let's additionally test for correlations between the difference of team and opponent goals scored in each game and features we designed to train ML algorithms on. 
 
@@ -607,7 +607,7 @@ cor.test(final_goals, df_join_t$Dif_Res_Skill)
 cor.test(final_goals, df_join_t$Dif_HoAw_Goals)
 
 ```
-Difference in goals is moderately (~38%) correlated with the differences in skill and number of goals each team scores on average. The result is promising in case we want to predict the most possible spread in goals.  
+Difference in goals is moderately (~38%) correlated with the differences in skill and number of goals each team scores on average with high statistical significance (p<2.2e-16). The result is promising in case we want to predict the most possible spread in goals.  
 
 
 ### Section D. Machine Learning
@@ -616,7 +616,7 @@ Before we start training models, let's prepare 3 data sets:
 "df_train" to train and tune hyper-parameters of the models
 "df_valid" to validate the resulting model
 and "df_test" for final estimation of models' accuracy and expected ROIs.
-Since we would like to predict outcome of every game as accurate as possible - let's try to prevent ML algorithms from choosing the "easiest" solution of ignoring one of the classes (usually the hardest to predict) completely. To show to ML algorithms that all classes are equally important we can either add higher weights for misclassification for misrepresented class in algorithms which accept weights or balance the classes using up-sampling or down-sampling. We will go with down-sampling. 
+Since we would like to predict outcome of every game as accurate as possible - let's try to prevent ML algorithms from choosing the "easiest" solution of ignoring one of the classes (usually the hardest one to predict) completely. To show to ML algorithms that all classes are equally important we can either add higher weights for misclassification for misrepresented classes in algorithms which accept weights or balance the classes using up-sampling or down-sampling. We will go with down-sampling. 
 However, we will down-sample only the training set, test and validation sets will be left intact, i.e. both of them having their original distribution of classes (game results).
 ```{r ML_prepare_data}
 df_joined<-df_join
@@ -684,7 +684,7 @@ Although the training dataset was balanced in terms of classes, it appears that 
 ### Elastic-Net Regularized Generalized Linear Models (GLMNET)
 Next let's see how Lasso and Elastic-Net Regularized Generalized Linear Models (glmnet) will perform. To make sure our model generalizes well - we will do repeated cross-validation to tune model's hyperparametrs and then test best performing model on the validation set. 
 
-But before we proceed, in order for the results to be reproducible, we would have to create seeds for each iteration of resampling. We have to use seeds and not set.seed because we are using parallel processing. Since there are multiple workers (Rscripts instances) plowing through parameters tune space independently from each other - specifying single seed won't work.  
+But before we proceed, in order for the results to be reproducible, we would have to create seeds for each iteration of the resampling. We have to use seeds and not "set.seed" function because we are using parallel processing. Since there are multiple workers (Rscripts instances) plowing through parameters tune space independently from each other - specifying single seed won't work.  
 
 We will have to provide a vector of lists which has a specific size. This size is equal to number of resamlpings (in our case its 3 repeats of 10-fold cross-validation = 30) plus 1 for the final model. Each element of the vector should contain a list of seeds as long as number of combinations one had in his/her parameter tuning grid. The tuning grid i used had 11 parameters for alpha and 41 parameter for lambda or total of 451 unique combinations. Last vector's element (for final model) may contain only a single seed, since by that point the best parameters were already selected.
 
@@ -769,7 +769,7 @@ seeds[[length(seeds)]]<-sample.int(1000, 1)
 
 And then let it train and choose best hyperparamters using repeated cross-validation:
 ```{r svm}
-library(kernlab)
+
 ctrl <- trainControl(method="repeatedcv",
                      number=10,
                      repeats = 3,
@@ -801,8 +801,8 @@ svm_dm$byClass
 ```
 
 
-L2 loss function with inverse of regularization parameter (cost) of 1.5 performed the best during repeated cross-validation at ~52% accuracy vs 33% base accuracy.
-Accuracy on validation set is similar to glmnet, but, as can be seen, it tends to ignore the draw class completely. Well, it's not ideal, of course, but all previous models had problems with predicting draws as well, so let's wait for estimation of its performance on test dataset.
+L2 loss function with inverse of regularization parameter (cost) of 1.5 performed the best during repeated cross-validation at ~56% accuracy vs 33% base accuracy.
+Accuracy on validation set is similar to glmnet, but, as can be seen, it tends to ignore the draw class completely. Well, it's not ideal, of course, but all previous models had problems with predicting draws as well, so let's wait for estimation of its performance on the test dataset.
 
 ### Multi-layer Perceptron
 Let's use multi-layer perceptron (mlp) with a decay parameter as our next model.
@@ -845,19 +845,15 @@ tune <-train(x=xc,
 ggplot(tune,highlight = T)
 tune$bestTune
 
-#library(plyr)
-#library(dplyr)
-#detach("package:caret", unload=TRUE)
-#library(caret)
+
 tune.pred<-predict(tune,yc,type="raw")
-#tune.predicted<-colnames(tune.pred)[max.col(tune.pred,ties.method="first")]
 
 tune_dm<-caret::confusionMatrix(tune.pred,zz)
 tune_dm$overall
 tune_dm$table
 tune_dm$byClass
 ```
-Mlp performed the worst on validation data out of all models tested, however, it tried to predict the most number of draws and got the highest number of them correctly. So if we create an ensemble of glmnet, regularized svm and mlp - mlp should be able counter-weight SVM which doesn't bother to predict any draws on validation set.
+Mlp performed the worst on validation data out of all models tested, however, it tried to predict the most number of draws and got the highest number of them correctly. So if we create an ensemble of glmnet, regularized svm and mlp - mlp should be able to "counter-weight" SVM which doesn't "bother" to predict any draws on the validation set.
 
 ### Ensemble
 Let's create a simple voting ensemble where each model has an equal vote. Outcome is chosen by the majority of votes. 
@@ -896,7 +892,7 @@ edm$byClass
 55% accuracy - overall decrease comparing to glmnet and svm. But still higher than the accuracy of the lowest performing model - mlp.
 
 ### Accuracy on test data
-Now since we have well performing models - let's test them on test data for final estimate of their accuracy.
+Now let's test our models on the test data for final estimate of their accuracy.
 
 Starting with glmnet
 ```{r}
@@ -907,7 +903,7 @@ glmnet_cm_final$overall
 glmnet_cm_final$table
 glmnet_cm_final$byClass
 ```
-60% accuracy at 49% null accuracy - quite good!
+60% accuracy at 49% null accuracy - pretty good result!
 
 Now let's see how svm performs
 ```{r}
@@ -929,7 +925,7 @@ tn_pr_final$overall
 tn_pr_final$table
 tn_pr_final$byClass
 ```
-61%! Wow! Mlp pleasantly surprised, outperforming svm and glment on final test data, correctly predicting good number (relatively to previous results) of draws (30% sensitivity) . A dark horse of our mini ML racing indeed.
+61%! Wow! Mlp pleasantly surprised, outperforming svm and glment on final test data, correctly predicting good number (relatively to previous results) of draws (with 30% sensitivity) . A dark horse of our mini ML racing indeed.
 
 Let's see if ensemble of the models will do better than any of the models individually: 
 ```{r}
@@ -945,9 +941,9 @@ classv_cm_final$byClass
 It does indeed! We got 1% improve in accuracy! Exciting!
 
 ### Models' Correlation
-Let's investigate why ensemble could have improved performance. For that, we will use caretEnsemble to train all of the models simultaneously and find out how models correlate to each other.
+Let's investigate why ensemble could have help to improve performance. For that, we will use caretEnsemble to train all of the models simultaneously and find out how models correlate to each other.
 ```{r}
-library(caretEnsemble)
+
 seed<-1234
 control <- trainControl(method="repeatedcv", 
                         number=10, 
@@ -976,11 +972,11 @@ modelCor(results)
 #splom(results)
 ```
 For boosting to work the best models should perform roughly the same. Which holds true for our models (graph for models vs accuracy and kappa estimates on training data)
-Boosting also requires models with low correlation to each other. The less the correlation the more the improvement in accuracy. In our case correlations are in 66-75% range which, of course, is relatively high but, nevertheless, due to models "having" different opinion in some of the cases - voting worked.  
-Adding to our boosting ensemble models which are less correlated to any of the existing once but still have similar performance can further improve the accuracy. Additionally, using probabilities for each model that allows it as weights in the voting (higher probability - higher confidence - more votes) shall further improve the boosting ensemble approach. 
+Boosting also requires to have models with low correlation to each other. The less the correlation the more the improvement in accuracy could be. In our case correlations are in 66-75% range which, of course, is relatively high but, nevertheless, due to models "having" different "opinion"" in some of the cases - voting overall works.  
+Adding to our boosting ensemble models which are less correlated to any of the existing models but still have similar performance can further improve the accuracy. Additionally, using probabilities for each model that allows it as weights in the voting (higher probability - higher confidence - more votes) shall further improve the boosting ensemble approach. 
 
-
-Now, since every project, in my opinion, should generate useful outcomes - let's use our algorithms and quantify possible earnings in case if we would actually placed the bets following algorithms' generated predictions. For that we will load additional dataframe containing odds by various online sports bookmakers. We will pretend we did a small $10 bet at all of them for every game and count our profits as money made - money invested. ROI is calculated as profits/money invested
+### ROI
+Now, since every project, in my opinion, should generate useful outcomes - let's use our algorithms and quantify possible earnings in case if we would actually placed the bets following algorithms' generated predictions. For that we will load additional dataframe containing odds by various online sports bookmakers. We will pretend we did a small $10 bet at all of them for every game and count our profits as money made minus money invested. ROI is calculated as the rario of the profit over money invested
 
 ```{r bookmaker}
 bookmaker_odds<-read.csv("Odds/sp1.csv",header = T)%>%
@@ -1064,12 +1060,11 @@ ROI_results$model<-c("glmnet","reg_SVM","mlp","ensemble")
 ROI_results%>%
    select(model,investment,return,profit,ROI)
 ```
-Wow! 13% ROI for ensemble voting model! Making make me $1000 in roughly just two months. Time to buy fleece vests and start my own hedge-fund!
+Wow! 13% ROI for ensemble voting model! Making $1000 in roughly just two months. Time to buy fleece vests and start my own hedge-fund!
 Svm betting on its own performed the worst making me only $605 or generating ~8% ROI.
 glmnet did slightly better earning extra 97 bucks comparing to svm and producing ~9% ROI.
-mlp is the best betting model winning me $916 resulting in ~12% ROI
+mlp is the best standalone model earning $916 and resulting in ~12% ROI
 
 ### Conclusion
-Machine learning and proper feature engineering can, in fact, make you money in sports betting domain. Such high (13%) ROI could, of course, arise out of pure luck due to some unknown factors. There was, for example, a slight increase in number of games won for the selected time range comparing to all-time average. And, it is definitely possible that the yearly averaged ROI can turn out to be much more humble. But it's betting after all so some risks are unavoidable. Nevertheless, there are (always!) ways to further decrease risks, get proper estimate on expected ROI and, hopefully, a way to boost profits and ROI to even higher values. But, since I already ordered fleece jackets, I should not probably reveal any further.
-Stay tuned, however, for updates about how real money betting is going to turn out.
-
+Machine learning and proper feature engineering can, in fact, make you money in sports betting domain. Such high (13%) ROI could, of course, arise out of pure luck due to some unknown factors. There was, for example, a slight increase in number of games won for the selected time range comparing to all-time average. And, it is definitely possible that the yearly averaged ROI can turn out to be much more humble. But it's betting after all, so some risks are unavoidable. There are, however, ways to further decrease risks, get proper estimate on expected ROI and, hopefully, a way to boost profits and ROI to even higher values. But, since I already ordered fleece jackets, I should not probably reveal any further.
+Stay tuned for updates about how real money betting is going to turn out.
